@@ -1,9 +1,9 @@
-let osc;
+// --- ポリフォニック音源管理用 ---
+let activeVoices = new Map();
 
 // --- MIDI制御用変数 ---
 let midiAccess = null;
-let activeNotes = new Set();
-let lastMidiNote = -1;
+let activeMidiKeys = new Set();
 
 // PCキーボード用音階
 const keyboardNotes = {
@@ -19,10 +19,6 @@ const keyboardNotes = {
 
 function setup() {
   createCanvas(windowWidth, windowHeight);
-  
-  osc = new p5.Oscillator('sawtooth');
-  osc.amp(0); 
-  osc.start();
 
   if (navigator.requestMIDIAccess) {
     navigator.requestMIDIAccess().then(onMIDISuccess, onMIDIFailure);
@@ -32,24 +28,13 @@ function setup() {
 }
 
 function draw() {
-  background(0, 0, 0, 40); 
+  background(0, 0, 0, 40);
 
-  let playing = false;
-  let currentNote = 0;
+  // PCキーボードの押下状況を同期
+  syncKeyboardNotes();
 
-  if (activeNotes.size > 0) {
-    playing = true;
-    currentNote = lastMidiNote;
-  } else {
-    let keys = [75, 74, 72, 71, 70, 68, 83, 65]; 
-    for (let k of keys) {
-      if (keyIsDown(k)) {
-        currentNote = keyboardNotes[k];
-        playing = true;
-        break; 
-      }
-    }
-  }
+  let playingCount = activeVoices.size;
+  let playing = playingCount > 0;
 
   let startX = width / 2;
   let startY = height / 2;
@@ -59,37 +44,93 @@ function draw() {
   // コア（玉）の常時表示
   noStroke();
   fill(200, 220, 255);
-  
+
   let coreSize;
   if (playing) {
-    coreSize = random(30, 60); 
+    // 和音数に応じてコアのサイズを拡大
+    coreSize = random(30, 50) + playingCount * 6;
   } else {
-    // 待機時はゆっくりと明滅・伸縮する
-    coreSize = 40 + sin(frameCount * 0.1) * 5; 
+    // 待機時はゆっくりと明滅・伸縮
+    coreSize = 40 + sin(frameCount * 0.1) * 5;
   }
   ellipse(startX, startY, coreSize);
 
   // 演奏中の処理
   if (playing) {
-    let frequencyVal = midiToFreq(currentNote);
-    osc.freq(frequencyVal);
-    osc.amp(random(0.4, 0.6), 0.05);
+    let targetAmp = 0.5 / Math.sqrt(playingCount);
+    let noteSum = 0;
 
-    // 360度にマッピング (-PI から PI)
-    let mappedNote = constrain(currentNote, 48, 84);
+    // 各オシレータの音量を更新し，平均ノート番号を算出
+    for (let [note, voice] of activeVoices.entries()) {
+      voice.osc.amp(targetAmp * random(0.8, 1.2), 0.05);
+      noteSum += note;
+    }
+
+    // 和音全体の平均ピッチから単一の角度を決定
+    let avgNote = noteSum / playingCount;
+    let mappedNote = constrain(avgNote, 48, 84);
     let baseAngle = map(mappedNote, 48, 84, -PI, PI);
-    baseAngle += random(-0.2, 0.2);
+    baseAngle += random(-0.15, 0.15);
 
+    // 和音数に応じて稲妻の太さを強化
     let boltLen = max(width, height) * 0.6;
-    generateLightning(startX, startY, baseAngle, 10, boltLen, 0.5);
-  } else {
-    osc.amp(0, 0.1);
+    let initialThickness = 9 + playingCount * 1.5;
+
+    // 稲妻を1本のみ放電
+    generateLightning(startX, startY, baseAngle, initialThickness, boltLen, 0.45);
   }
 
   blendMode(BLEND);
 }
 
-// --- MIDI制御関数 ---
+// --- ボイス（単音）の生成と破棄 ---
+function noteOn(note) {
+  if (activeVoices.has(note)) return;
+
+  let osc = new p5.Oscillator('sawtooth');
+  let freq = midiToFreq(note);
+  osc.freq(freq);
+  osc.amp(0);
+  osc.start();
+
+  activeVoices.set(note, { osc: osc });
+}
+
+function noteOff(note) {
+  if (!activeVoices.has(note)) return;
+
+  let voice = activeVoices.get(note);
+  voice.osc.amp(0, 0.08);
+  setTimeout(() => {
+    voice.osc.stop();
+    voice.osc.dispose();
+  }, 100);
+
+  activeVoices.delete(note);
+}
+
+// --- PCキーボードの同時押し同期処理 ---
+function syncKeyboardNotes() {
+  for (let [key, note] of Object.entries(keyboardNotes)) {
+    let keyCode = Number(key);
+    if (keyIsDown(keyCode)) {
+      if (!activeVoices.has(note)) {
+        noteOn(note);
+      }
+    } else {
+      if (activeVoices.has(note) && !activeMidiKeys.has(note)) {
+        noteOff(note);
+      }
+    }
+  }
+}
+
+// --- 周波数変換関数 ---
+function midiToFreq(midiNote) {
+  return 440 * Math.pow(2, (midiNote - 69) / 12);
+}
+
+// --- MIDI制御 ---
 function onMIDISuccess(access) {
   midiAccess = access;
   console.log("MIDI Access Successful!");
@@ -108,60 +149,69 @@ function getMIDIMessage(message) {
   let velocity = (message.data.length > 2) ? message.data[2] : 0;
 
   if (command === 144 && velocity > 0) {
-    activeNotes.add(note);
-    lastMidiNote = note;
-    userStartAudio(); 
-  } else if (command === 128 || (command === 144 && velocity === 0)) {
-    activeNotes.delete(note);
-    if (activeNotes.size > 0 && note === lastMidiNote) {
-      let items = Array.from(activeNotes);
-      lastMidiNote = items[items.length - 1];
+    activeMidiKeys.add(note);
+    noteOn(note);
+    if (typeof userStartAudio === 'function') {
+      userStartAudio();
     }
+  } else if (command === 128 || (command === 144 && velocity === 0)) {
+    activeMidiKeys.delete(note);
+    noteOff(note);
   }
 }
 
 // --- 稲妻生成関数 ---
 function generateLightning(x, y, angle, thickness, len, branchProb) {
-  if (thickness < 1 || len < 10) return;
+  if (thickness < 1 || len < 15) return;
 
   push();
   strokeJoin(ROUND);
 
-  let jitter = map(thickness, 10, 1, 0.1, 0.8); 
+  let jitter = map(thickness, 15, 1, 0.1, 0.7);
   let currentAngle = angle + random(-jitter, jitter);
-  
-  let segmentLen = random(20, 60);
+
+  let segmentLen = random(20, 50);
   if (segmentLen > len) segmentLen = len;
 
   let nextX = x + cos(currentAngle) * segmentLen;
   let nextY = y + sin(currentAngle) * segmentLen;
 
-  strokeWeight(thickness * 5);
-  stroke(100, 0, 255, 30); 
+  // 外側の発光
+  strokeWeight(thickness * 4.5);
+  stroke(100, 0, 255, 25);
   line(x, y, nextX, nextY);
 
-  strokeWeight(thickness * 2.5);
-  stroke(150, 100, 255, 100); 
+  // 中間の光
+  strokeWeight(thickness * 2.2);
+  stroke(160, 110, 255, 90);
   line(x, y, nextX, nextY);
 
+  // 芯の白光
   strokeWeight(thickness);
-  stroke(255, 255, 255, 255); 
+  stroke(255, 255, 255, 240);
   line(x, y, nextX, nextY);
 
   pop();
-  
+
   let remainingLen = len - segmentLen;
-  
   generateLightning(nextX, nextY, currentAngle, thickness * 0.85, remainingLen, branchProb);
 
   if (random() < branchProb) {
-    let branchAngle = currentAngle + random(-1.0, 1.0);
-    generateLightning(nextX, nextY, branchAngle, thickness * 0.4, remainingLen * 0.6, branchProb);
+    let branchAngle = currentAngle + random(-0.9, 0.9);
+    generateLightning(nextX, nextY, branchAngle, thickness * 0.45, remainingLen * 0.6, branchProb);
   }
 }
 
 function mousePressed() {
-  userStartAudio();
+  if (typeof userStartAudio === 'function') {
+    userStartAudio();
+  }
+}
+
+function keyPressed() {
+  if (typeof userStartAudio === 'function') {
+    userStartAudio();
+  }
 }
 
 function windowResized() {
